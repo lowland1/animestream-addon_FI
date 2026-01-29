@@ -1118,10 +1118,24 @@ const CONFIGURE_HTML = `<!doctype html>
                   <option value="n_3">3 torrents per quality</option>
                   <option value="n_5">5 torrents per quality</option>
                 </optgroup>
+                <optgroup label="Minimum Seeders">
+                  <option value="s_1">Min 1 seeder</option>
+                  <option value="s_5">Min 5 seeders</option>
+                  <option value="s_10">Min 10 seeders</option>
+                  <option value="s_25">Min 25 seeders</option>
+                  <option value="s_50">Min 50 seeders</option>
+                </optgroup>
+                <optgroup label="Minimum Size">
+                  <option value="sz_100">Min 100 MB</option>
+                  <option value="sz_250">Min 250 MB</option>
+                  <option value="sz_500">Min 500 MB</option>
+                  <option value="sz_1000">Min 1 GB</option>
+                  <option value="sz_2000">Min 2 GB</option>
+                </optgroup>
               </select>
               <button class="btn btn-sm btn-outline" id="torrentPrefsClear" type="button">Reset</button>
             </div>
-            <div class="help">Customize torrent search: qualities to include, audio types, and results limit.</div>
+            <div class="help">Customize torrent search: qualities, audio types, results limit, and minimum seeders/size filters.</div>
             <div id="torrentPrefsPills" class="pill-grid"></div>
           </div>
         </div>
@@ -1426,7 +1440,9 @@ const CONFIGURE_HTML = `<!doctype html>
     const TORRENT_PREF_NAMES = {
       'q_4k': '4K / 2160p', 'q_1080': '1080p', 'q_720': '720p', 'q_480': '480p or lower',
       'a_raw': 'RAW', 'a_sub': 'SUB', 'a_dub': 'DUB', 'a_dual': 'DUAL Audio',
-      'n_1': '1 per quality', 'n_2': '2 per quality', 'n_3': '3 per quality', 'n_5': '5 per quality'
+      'n_1': '1 per quality', 'n_2': '2 per quality', 'n_3': '3 per quality', 'n_5': '5 per quality',
+      's_1': 'Min 1 seed', 's_5': 'Min 5 seeds', 's_10': 'Min 10 seeds', 's_25': 'Min 25 seeds', 's_50': 'Min 50 seeds',
+      'sz_100': 'Min 100MB', 'sz_250': 'Min 250MB', 'sz_500': 'Min 500MB', 'sz_1000': 'Min 1GB', 'sz_2000': 'Min 2GB'
     };
     
     function renderTorrentPrefsPills() {
@@ -1462,9 +1478,15 @@ const CONFIGURE_HTML = `<!doctype html>
         
         if (!state.torrentPrefs) state.torrentPrefs = [];
         if (!state.torrentPrefs.includes(val)) {
-          // Count options (n_*) are mutually exclusive - remove any existing count option
+          // Mutually exclusive options - remove existing of same type
           if (val.startsWith('n_')) {
             state.torrentPrefs = state.torrentPrefs.filter(p => !p.startsWith('n_'));
+          }
+          if (val.startsWith('s_')) {
+            state.torrentPrefs = state.torrentPrefs.filter(p => !p.startsWith('s_'));
+          }
+          if (val.startsWith('sz_')) {
+            state.torrentPrefs = state.torrentPrefs.filter(p => !p.startsWith('sz_'));
           }
           state.torrentPrefs.push(val);
           persist();
@@ -5695,6 +5717,49 @@ function isDualAudioRelease(title) {
 }
 
 /**
+ * Parse torrent size string to megabytes
+ * Handles: "542.13 MiB", "1.2 GiB", "500 MB", "2 GB", "1.5G", etc.
+ * @returns {number} Size in MB, or 0 if unparseable
+ */
+function parseSizeToMB(sizeStr) {
+  if (!sizeStr || typeof sizeStr !== 'string') return 0;
+  
+  // Normalize the string
+  const normalized = sizeStr.trim().replace(/,/g, '');
+  
+  // Match number and unit
+  const match = normalized.match(/^([\d.]+)\s*(GiB|GB|G|MiB|MB|M|KiB|KB|K|TiB|TB|T)?$/i);
+  if (!match) return 0;
+  
+  const value = parseFloat(match[1]);
+  if (isNaN(value)) return 0;
+  
+  const unit = (match[2] || 'MB').toUpperCase();
+  
+  // Convert to MB
+  switch (unit) {
+    case 'TIB':
+    case 'TB':
+    case 'T':
+      return value * 1024 * 1024;
+    case 'GIB':
+    case 'GB':
+    case 'G':
+      return value * 1024;
+    case 'MIB':
+    case 'MB':
+    case 'M':
+      return value;
+    case 'KIB':
+    case 'KB':
+    case 'K':
+      return value / 1024;
+    default:
+      return value; // Assume MB
+  }
+}
+
+/**
  * Get audio type indicator for a torrent
  * Returns: 'DUAL' | 'DUB' | 'RAW' | 'SUB' (default)
  */
@@ -7923,14 +7988,66 @@ async function resolveTorBox(magnet, apiKey, fileIndex = 0, episode = null, seas
         if (episode && videoFiles.length > 1) {
           console.log(`[TB Resolve] Looking for episode ${episode} in ${videoFiles.length} files`);
           
+          // First pass: exact extractEpisodeInfo match
+          let found = false;
           for (const file of videoFiles) {
             const filename = file.name || file.short_name || '';
-            const epMatch = extractEpisodeNumber(filename);
-            if (epMatch === episode) {
+            const info = extractEpisodeInfo(filename);
+            if (info.episode === episode) {
               selectedFile = file;
               console.log(`[TB Resolve] Found episode ${episode}: ${filename}`);
+              found = true;
               break;
             }
+          }
+          
+          // Second pass: try additional loose patterns
+          if (!found) {
+            console.log(`[TB Resolve] No exact match, trying loose patterns for E${episode}...`);
+            const episodePadded = String(episode).padStart(2, '0');
+            const episodePadded3 = String(episode).padStart(3, '0');
+            
+            for (const file of videoFiles) {
+              const fn = (file.name || file.short_name || '').toLowerCase();
+              
+              // Try patterns: "- 04", "e04", "ep04", "episode 04", "[04]", "_04_", ".04."
+              // IMPORTANT: Use padded episode numbers to avoid matching wrong episodes
+              // e.g., episode 4 should NOT match "e40" or "episode 41"
+              const loosePatterns = [
+                new RegExp(`\\s-\\s${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'),      // " - 04"
+                new RegExp(`\\bE${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'),       // "E04" with word boundary
+                new RegExp(`\\bEp\\.?\\s*${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'), // "Ep.04" or "Ep 04"
+                new RegExp(`\\bEpisode\\s*${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'), // "Episode 04"
+                new RegExp(`\\[${episodePadded}\\]`, 'i'),                                    // "[04]"
+                new RegExp(`_${episodePadded}(?:v\\d+)?(?:_|\\.)`, 'i'),                       // "_04_" or "_04."
+                new RegExp(`\\.${episodePadded}(?:v\\d+)?\\.`, 'i'),                           // ".04."
+                // Exact match at end of filename before extension
+                new RegExp(`[\\s_.-]${episodePadded}(?:v\\d+)?\\.[a-z0-9]{2,4}$`, 'i'),
+                new RegExp(`[\\s_.-]${episodePadded3}(?:v\\d+)?\\.[a-z0-9]{2,4}$`, 'i'),
+              ];
+              
+              for (const pattern of loosePatterns) {
+                if (pattern.test(fn)) {
+                  selectedFile = file;
+                  console.log(`[TB Resolve] Loose match: ${file.name || file.short_name} (pattern: ${pattern.source})`);
+                  found = true;
+                  break;
+                }
+              }
+              if (found) break;
+            }
+          }
+          
+          if (!found) {
+            // CRITICAL: For batch torrents, don't use wrong episode - fail instead
+            if (videoFiles.length > 1) {
+              console.error(`[TB Resolve] ❌ EPISODE MATCH FAILED: No file matched episode ${episode} in batch with ${videoFiles.length} files`);
+              return { 
+                status: 'episode_not_found', 
+                message: `Episode ${episode} not found in this batch torrent. The torrent may have different episode numbering. Try a different torrent source.`
+              };
+            }
+            console.log(`[TB Resolve] WARNING: No file matched episode ${episode} - using only available file`);
           }
         }
         
@@ -8117,13 +8234,57 @@ async function getAllDebridFiles(magnetId, apiKey, fileIndex = 0, episode = null
         selectedFile = candidates[0].file;
         console.log(`[AD Files] Selected: ${selectedFile.filename}`);
       } else {
-        // STRICT MODE: No fallback to position-based selection
-        // This prevents wrong episode selection in batch torrents
-        console.log(`[AD Files] WARNING: No file matched episode ${episode} - will use largest file`);
+        // STRICT MODE: Try additional patterns to find the right episode
+        // Some files use different patterns: "Show Name Episode 04.mkv" or "04.mkv"
+        console.log(`[AD Files] No exact match found, trying looser patterns for E${episode}...`);
+        
+        const episodePadded = String(episode).padStart(2, '0');
+        const episodePadded3 = String(episode).padStart(3, '0');
+        
+        for (const file of videoFiles) {
+          const fn = (file.filename || file.path || '').toLowerCase();
+          
+          // Try patterns: "- 04", "e04", "ep04", "episode 04", "[04]", "_04_", ".04."
+          // IMPORTANT: Use padded episode numbers to avoid matching wrong episodes
+          // e.g., episode 4 should NOT match "e40" or "episode 41"
+          const loosePatterns = [
+            new RegExp(`\\s-\\s${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'),      // " - 04"
+            new RegExp(`\\bE${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'),       // "E04" with word boundary
+            new RegExp(`\\bEp\\.?\\s*${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'), // "Ep.04" or "Ep 04"
+            new RegExp(`\\bEpisode\\s*${episodePadded}(?:v\\d+)?(?:\\s|\\.|\\[|\\(|$)`, 'i'), // "Episode 04"
+            new RegExp(`\\[${episodePadded}\\]`, 'i'),                                    // "[04]"
+            new RegExp(`_${episodePadded}(?:v\\d+)?(?:_|\\.)`, 'i'),                       // "_04_" or "_04."
+            new RegExp(`\\.${episodePadded}(?:v\\d+)?\\.`, 'i'),                           // ".04."
+            // Exact match at end of filename before extension
+            new RegExp(`[\\s_.-]${episodePadded}(?:v\\d+)?\\.[a-z0-9]{2,4}$`, 'i'),
+            new RegExp(`[\\s_.-]${episodePadded3}(?:v\\d+)?\\.[a-z0-9]{2,4}$`, 'i'),
+          ];
+          
+          for (const pattern of loosePatterns) {
+            if (pattern.test(fn)) {
+              selectedFile = file;
+              console.log(`[AD Files] Loose match: ${file.filename} (pattern: ${pattern.source})`);
+              break;
+            }
+          }
+          if (selectedFile) break;
+        }
+        
+        if (!selectedFile) {
+          // CRITICAL: For batch torrents, don't fall back to largest file - wrong episode risk is too high
+          if (videoFiles.length > 1) {
+            console.error(`[AD Files] ❌ EPISODE MATCH FAILED: No file matched episode ${episode} in batch with ${videoFiles.length} files`);
+            return { 
+              status: 'episode_not_found', 
+              message: `Episode ${episode} not found in this batch torrent. The torrent may have different episode numbering. Try a different torrent source.`
+            };
+          }
+          console.log(`[AD Files] WARNING: No file matched episode ${episode} - using only available file`);
+        }
       }
     }
     
-    // Fallback to specified index or largest file
+    // Fallback to specified index or largest file (only for single-file torrents or when no episode specified)
     if (!selectedFile) {
       selectedFile = videoFiles[fileIndex] || videoFiles.sort((a, b) => b.size - a.size)[0];
     }
@@ -8838,7 +8999,37 @@ async function handleStream(catalog, type, id, config = {}, requestUrl = null) {
       // Pass both absolute episode (for torrents like "One Piece 936") and seasonal episode (for "S21E45" patterns)
       console.log(`[Stream] Enriched anime: anidb_id=${enrichedAnime.anidb_id}, mal_id=${enrichedAnime.mal_id}, synonyms=${enrichedAnime.synonyms?.length || 0}`);
       console.log(`[Stream] Torrent search: E${torrentAbsoluteEpisode} (absolute) / S${season}E${episode} (seasonal)`);
-      const torrents = await getTorrentStreams(enrichedAnime, torrentAbsoluteEpisode, season, type === 'movie' ? 'movie' : null, episode);
+      let torrents = await getTorrentStreams(enrichedAnime, torrentAbsoluteEpisode, season, type === 'movie' ? 'movie' : null, episode);
+      
+      // Apply user torrent preferences filters (min seeders, min size)
+      const torrentPrefs = config.torrentPrefs || [];
+      const minSeedersMatch = torrentPrefs.find(p => p.startsWith('s_'));
+      const minSizeMatch = torrentPrefs.find(p => p.startsWith('sz_'));
+      
+      if (minSeedersMatch || minSizeMatch) {
+        const minSeeders = minSeedersMatch ? parseInt(minSeedersMatch.replace('s_', '')) : 0;
+        const minSizeMB = minSizeMatch ? parseInt(minSizeMatch.replace('sz_', '')) : 0;
+        
+        const beforeCount = torrents.length;
+        torrents = torrents.filter(t => {
+          // Check seeders
+          if (minSeeders > 0 && (t.seeders || 0) < minSeeders) {
+            return false;
+          }
+          // Check size (parse size string like "542.13 MiB" or "1.2 GiB")
+          if (minSizeMB > 0 && t.size) {
+            const sizeMB = parseSizeToMB(t.size);
+            if (sizeMB > 0 && sizeMB < minSizeMB) {
+              return false;
+            }
+          }
+          return true;
+        });
+        
+        if (torrents.length !== beforeCount) {
+          console.log(`[Stream] Filtered torrents by prefs: ${beforeCount} → ${torrents.length} (minSeeders=${minSeeders}, minSizeMB=${minSizeMB})`);
+        }
+      }
       
       if (torrents.length > 0) {
         console.log(`[Stream] Found ${torrents.length} torrent streams for "${animeName}" ${type === 'movie' ? '(MOVIE)' : `E${absoluteEpisode}`}`);
@@ -9087,6 +9278,16 @@ export default {
           }, { status: 409 }); // 409 = Conflict (content mismatch)
         }
         
+        // Handle "episode_not_found" status - batch torrent doesn't contain the episode
+        if (result && typeof result === 'object' && result.status === 'episode_not_found') {
+          console.log(`[Debrid Play] Episode not found in batch torrent - returning error`);
+          return jsonResponse({ 
+            error: 'Episode not found',
+            message: result.message || 'The requested episode was not found in this torrent.',
+            hint: 'Try a different torrent source with the specific episode.'
+          }, { status: 404 }); // 404 = Not Found
+        }
+        
         if (!result || typeof result !== 'string') {
           return jsonResponse({ 
             error: 'Failed to resolve torrent',
@@ -9094,7 +9295,41 @@ export default {
           }, { status: 500 });
         }
         
-        console.log(`[Debrid Play] Resolved to: ${result.substring(0, 50)}...`);
+        console.log(`[Debrid Play] Resolved to: ${result.substring(0, 80)}...`);
+        
+        // Validate the resolved URL before redirecting
+        // This prevents 5XX errors from expired/invalid debrid URLs
+        try {
+          const validateResponse = await fetch(result, {
+            method: 'HEAD',
+            headers: { 'User-Agent': 'Stremio/1.0' }
+          });
+          
+          if (!validateResponse.ok) {
+            console.error(`[Debrid Play] URL validation failed: ${validateResponse.status}`);
+            
+            // If URL expired/invalid, clear cache and retry once
+            const cacheKey = `debrid:${provider}:${infoHash}:${episode || 'all'}`;
+            debridCache.delete(cacheKey);
+            
+            // Try resolving again without cache
+            const retryResult = await resolveDebrid(magnet, infoHash, provider, apiKey, fileIndex, episode, season, expectedAnimeName);
+            
+            if (retryResult && typeof retryResult === 'string') {
+              console.log(`[Debrid Play] Retry successful, redirecting to fresh URL`);
+              return Response.redirect(retryResult, 302);
+            }
+            
+            return jsonResponse({ 
+              error: 'Stream URL expired',
+              message: 'The stream URL has expired. Please try playing again.',
+              hint: 'If this persists, try a different torrent.'
+            }, { status: 503 });
+          }
+        } catch (validateErr) {
+          console.error(`[Debrid Play] URL validation error: ${validateErr.message}`);
+          // Continue with redirect anyway - some servers don't support HEAD
+        }
         
         // Redirect to the direct stream URL
         return Response.redirect(result, 302);
