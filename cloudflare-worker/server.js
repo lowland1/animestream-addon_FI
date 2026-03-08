@@ -1,18 +1,31 @@
 const express = require('express');
-const { fetch } = require('./worker-github.js');  // Adjust if using worker-github.js instead
+const workerModule = require('./worker-github.js');  // Change to './worker-github.js' if that's the one with proxy
+
+// Get the fetch handler – common patterns
+let workerFetch;
+if (typeof workerModule === 'function') {
+  workerFetch = workerModule;  // if default export is fetch
+} else if (workerModule.fetch) {
+  workerFetch = workerModule.fetch;  // export { fetch }
+} else if (workerModule.default && workerModule.default.fetch) {
+  workerFetch = workerModule.default.fetch;
+} else {
+  throw new Error('No valid fetch handler found in worker.js');
+}
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware to handle raw body for non-GET requests
-app.use(express.raw({ type: '*/*' }));
+app.use(express.raw({ type: '*/*', limit: '50mb' }));  // For large bodies if any
 
 app.all('*', async (req, res) => {
-  const url = new URL(req.originalUrl, `https://${req.headers.host}`);
+  console.log(`Request: ${req.method} ${req.originalUrl}`);  // Log every request
+
+  const url = new URL(req.originalUrl, `http://localhost:${port}`);
   const headers = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    headers.append(key, value);
-  }
+  Object.entries(req.headers).forEach(([key, value]) => {
+    if (value) headers.append(key, Array.isArray(value) ? value.join(', ') : value);
+  });
 
   const request = new Request(url, {
     method: req.method,
@@ -21,20 +34,41 @@ app.all('*', async (req, res) => {
     redirect: 'manual',
   });
 
-  // Simulate env and ctx (adjust if your worker uses specific env vars like KV)
-  const env = {};  // Add any env vars your worker needs, e.g., env.MY_KV = someBinding;
-  const ctx = { waitUntil: () => Promise.resolve(), passThroughOnException: () => {} };
+  const env = {};  // Mock – add real if needed, e.g. env = { SOME_VAR: process.env.SOME_VAR }
+  const ctx = {
+    waitUntil: (promise) => promise.catch(console.error),
+    passThroughOnException: () => {},
+  };
 
   try {
-    const response = await fetch(request, env, ctx);
-    res.status(response.status);
-    response.headers.forEach((value, key) => {
+    const response = await workerFetch(request, env, ctx);
+
+    res.status(response.status || 200);
+
+    for (const [key, value] of response.headers.entries()) {
       res.setHeader(key, value);
-    });
-    const body = await response.arrayBuffer();
-    res.send(Buffer.from(body));
+    }
+
+    // Better streaming for videos
+    if (response.body) {
+      response.body.pipeTo(new WritableStream({
+        write(chunk) {
+          res.write(chunk);
+        },
+        close() {
+          res.end();
+        },
+        abort(err) {
+          console.error('Stream error:', err);
+          res.end();
+        }
+      })).catch(err => console.error('Pipe error:', err));
+    } else {
+      res.send(await response.text());
+    }
   } catch (error) {
-    res.status(500).send('Internal Server Error');
+    console.error('Worker error:', error);
+    res.status(500).send('Internal Server Error: ' + (error.message || 'Unknown'));
   }
 });
 
