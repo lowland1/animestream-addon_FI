@@ -1,5 +1,5 @@
 const express = require('express');
-const { fetch } = require('./worker.js');  // Adjust if using worker-github.js instead
+const { fetch } = require('./worker-github.js');  // Adjust if using worker-github.js instead
 
 const app = express();
 const port = process.env.PORT || 3000;
