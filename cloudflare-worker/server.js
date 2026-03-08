@@ -1,77 +1,100 @@
 const express = require('express');
-const workerModule = require('./worker-github.js');  // Change to './worker-github.js' if that's the one with proxy
+const workerModule = require('./worker-github.js');  // Your working file
 
-// Get the fetch handler – common patterns
+// Detect the fetch handler
 let workerFetch;
 if (typeof workerModule === 'function') {
-  workerFetch = workerModule;  // if default export is fetch
-} else if (workerModule.fetch) {
-  workerFetch = workerModule.fetch;  // export { fetch }
+  workerFetch = workerModule;
+} else if (workerModule.fetch && typeof workerModule.fetch === 'function') {
+  workerFetch = workerModule.fetch;
+} else if (workerModule.default && typeof workerModule.default === 'function') {
+  workerFetch = workerModule.default;
 } else if (workerModule.default && workerModule.default.fetch) {
   workerFetch = workerModule.default.fetch;
 } else {
-  throw new Error('No valid fetch handler found in worker.js');
+  throw new Error('Could not find a valid fetch handler in worker-github.js. Check export style.');
 }
+
+console.log('Successfully loaded worker fetch handler from worker-github.js');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(express.raw({ type: '*/*', limit: '50mb' }));  // For large bodies if any
+// Handle raw/binary bodies for proxy/stream requests
+app.use(express.raw({ type: '*/*', limit: '200mb' }));
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  next();
+});
+
+app.options('*', (req, res) => res.sendStatus(200));
 
 app.all('*', async (req, res) => {
-  console.log(`Request: ${req.method} ${req.originalUrl}`);  // Log every request
-
-  const url = new URL(req.originalUrl, `http://localhost:${port}`);
-  const headers = new Headers();
-  Object.entries(req.headers).forEach(([key, value]) => {
-    if (value) headers.append(key, Array.isArray(value) ? value.join(', ') : value);
-  });
-
-  const request = new Request(url, {
-    method: req.method,
-    headers,
-    body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : null,
-    redirect: 'manual',
-  });
-
-  const env = {};  // Mock – add real if needed, e.g. env = { SOME_VAR: process.env.SOME_VAR }
-  const ctx = {
-    waitUntil: (promise) => promise.catch(console.error),
-    passThroughOnException: () => {},
-  };
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
 
   try {
-    const response = await workerFetch(request, env, ctx);
-
-    res.status(response.status || 200);
-
-    for (const [key, value] of response.headers.entries()) {
-      res.setHeader(key, value);
+    const url = new URL(req.originalUrl, `https://${req.headers.host || 'localhost'}`);
+    const headers = new Headers();
+    for (const [key, val] of Object.entries(req.headers)) {
+      if (val) headers.append(key, Array.isArray(val) ? val.join(', ') : val);
     }
 
-    // Better streaming for videos
+    // Create CF-like Request
+    const request = new Request(url.toString(), {
+      method: req.method,
+      headers,
+      body: req.method === 'GET' || req.method === 'HEAD' ? null : req.body,
+      redirect: 'manual',
+    });
+
+    const env = {}; // If your script uses env vars/bindings, add them here e.g. env.API_KEY = 'xxx'
+    const ctx = {
+      waitUntil: (p) => p.catch(e => console.error('waitUntil error:', e)),
+      passThroughOnException: () => {},
+    };
+
+    const response = await workerFetch(request, env, ctx);
+
+    res.status(response.status);
+
+    // Copy all headers
+    response.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+
+    // Handle streaming response (critical for video proxy)
     if (response.body) {
-      response.body.pipeTo(new WritableStream({
-        write(chunk) {
-          res.write(chunk);
+      const reader = response.body.getReader();
+      const stream = new ReadableStream({
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(value);
+          } catch (err) {
+            controller.error(err);
+          }
         },
-        close() {
-          res.end();
-        },
-        abort(err) {
-          console.error('Stream error:', err);
-          res.end();
+        cancel() {
+          reader.releaseLock();
         }
-      })).catch(err => console.error('Pipe error:', err));
+      });
+
+      // Pipe to Express response
+      stream.pipe(res);
     } else {
       res.send(await response.text());
     }
   } catch (error) {
-    console.error('Worker error:', error);
-    res.status(500).send('Internal Server Error: ' + (error.message || 'Unknown'));
+    console.error('Worker execution failed:', error.stack || error);
+    res.status(500).send(`Internal Server Error\n\nDetails: ${error.message || 'Unknown error'}\nCheck server logs for stack trace.`);
   }
 });
 
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`Worker proxy server running on port ${port}`);
 });
