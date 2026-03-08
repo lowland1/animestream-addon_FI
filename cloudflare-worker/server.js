@@ -1,7 +1,7 @@
 const express = require('express');
-const workerModule = require('./worker-github.js');  // Your working file
+const workerModule = require('./worker-github.js');  // Loads your working worker file
 
-// Detect the fetch handler
+// Detect the fetch handler (covers different export styles)
 let workerFetch;
 if (typeof workerModule === 'function') {
   workerFetch = workerModule;
@@ -20,27 +20,31 @@ console.log('Successfully loaded worker fetch handler from worker-github.js');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Handle raw/binary bodies for proxy/stream requests
+// Support large raw bodies (for any POST or proxy needs)
 app.use(express.raw({ type: '*/*', limit: '200mb' }));
+
+// Add CORS headers globally
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
   next();
 });
 
+// Handle OPTIONS preflight
 app.options('*', (req, res) => res.sendStatus(200));
 
 app.all('*', async (req, res) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} - from IP: ${req.ip}`);
 
   try {
-    const url = new URL(req.originalUrl, `https://${req.headers.host || 'localhost'}`);
+    // Build full URL using host from request (Render sets headers.host)
+    const url = new URL(req.originalUrl, `https://${req.headers.host || 'localhost:' + port}`);
     const headers = new Headers();
     for (const [key, val] of Object.entries(req.headers)) {
       if (val) headers.append(key, Array.isArray(val) ? val.join(', ') : val);
     }
 
-    // Create CF-like Request
     const request = new Request(url.toString(), {
       method: req.method,
       headers,
@@ -48,7 +52,7 @@ app.all('*', async (req, res) => {
       redirect: 'manual',
     });
 
-    const env = {}; // If your script uses env vars/bindings, add them here e.g. env.API_KEY = 'xxx'
+    const env = {};  // Add any needed env vars here later if logs complain
     const ctx = {
       waitUntil: (p) => p.catch(e => console.error('waitUntil error:', e)),
       passThroughOnException: () => {},
@@ -56,42 +60,57 @@ app.all('*', async (req, res) => {
 
     const response = await workerFetch(request, env, ctx);
 
-    res.status(response.status);
+    console.log(`Worker returned status: ${response.status}`);
 
-    // Copy all headers
+    res.status(response.status || 200);
+
+    // Copy all headers from worker response
     response.headers.forEach((value, key) => {
       res.setHeader(key, value);
     });
 
-    // Handle streaming response (critical for video proxy)
+    // Safe body handling – this fixes the pipe error
     if (response.body) {
-      const reader = response.body.getReader();
-      const stream = new ReadableStream({
-        async pull(controller) {
-          try {
-            const { done, value } = await reader.read();
-            if (done) {
-              controller.close();
-              return;
-            }
-            controller.enqueue(value);
-          } catch (err) {
-            controller.error(err);
-          }
-        },
-        cancel() {
-          reader.releaseLock();
-        }
-      });
+      console.log('Response has body – attempting to stream');
 
-      // Pipe to Express response
-      stream.pipe(res);
+      // Check if it's a web ReadableStream (has .getReader / .pipeTo)
+      if (typeof response.body.getReader === 'function') {
+        console.log('Detected web ReadableStream – using pipeTo fallback');
+        await response.body.pipeTo(new WritableStream({
+          write(chunk) {
+            res.write(chunk);
+          },
+          close() {
+            res.end();
+          },
+          abort(err) {
+            console.error('Stream aborted:', err);
+            res.end();
+          }
+        }));
+      } else if (typeof response.body.pipe === 'function') {
+        // Node.js Readable – direct pipe
+        console.log('Detected Node Readable – using .pipe(res)');
+        response.body.pipe(res);
+        // Express handles end() on finish
+      } else {
+        // Fallback: consume as text (for small responses like JSON)
+        console.log('Body not streamable – falling back to text');
+        const text = await response.text();
+        res.send(text);
+      }
     } else {
-      res.send(await response.text());
+      // No body at all (e.g. 204 No Content)
+      console.log('No response body');
+      res.send(await response.text() || '');
     }
   } catch (error) {
-    console.error('Worker execution failed:', error.stack || error);
-    res.status(500).send(`Internal Server Error\n\nDetails: ${error.message || 'Unknown error'}\nCheck server logs for stack trace.`);
+    console.error('Worker execution failed:', error.stack || error.message);
+    res.status(500).send(
+      `Internal Server Error\n\n` +
+      `Details: ${error.message || 'Unknown error'}\n` +
+      `Check Render logs for full stack trace.`
+    );
   }
 });
 
