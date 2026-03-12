@@ -34,6 +34,12 @@ app.use((req, res, next) => {
 // Handle OPTIONS preflight
 app.options('*', (req, res) => res.sendStatus(200));
 
+// Quick configure route for testing cold starts
+app.get("/configure", (req, res) => {
+  console.log(`[${new Date().toISOString()}] /configure hit!`);
+  res.send("Server is awake"); // responds instantly
+});
+
 app.all('*', async (req, res) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} - from IP: ${req.ip}`);
 
